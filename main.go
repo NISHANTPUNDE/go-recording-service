@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,10 +53,28 @@ func main() {
 		port = "8081"
 	}
 
+	// CORS middleware
+	corsHandler := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			h(w, r)
+		}
+	}
+
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 	})
+
+	// Recordings API
+	http.HandleFunc("/recordings", corsHandler(handleListRecordings))
+	http.HandleFunc("/recordings/", corsHandler(handleRecordingFile))
 
 	log.Printf("[GO-SFU] Starting on port %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
@@ -424,5 +444,102 @@ func recordRoom(room *Room) {
 		log.Println("FFmpeg conversion error:", err)
 	} else {
 		log.Printf("[GO-SFU] Converted to: %s", wavFilename)
+	}
+}
+
+// Recording represents a recording file for JSON response
+type RecordingInfo struct {
+	Filename  string `json:"filename"`
+	Size      int64  `json:"size"`
+	CreatedAt string `json:"createdAt"`
+	URL       string `json:"url"`
+}
+
+// handleListRecordings returns all recordings as JSON
+func handleListRecordings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	files, err := os.ReadDir("recordings")
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"recordings": []RecordingInfo{}})
+			return
+		}
+		http.Error(w, "Failed to read recordings", http.StatusInternalServerError)
+		return
+	}
+
+	var recordings []RecordingInfo
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
+		// Only include audio files
+		name := file.Name()
+		if !strings.HasSuffix(name, ".ogg") && !strings.HasSuffix(name, ".wav") {
+			continue
+		}
+		recordings = append(recordings, RecordingInfo{
+			Filename:  name,
+			Size:      info.Size(),
+			CreatedAt: info.ModTime().Format(time.RFC3339),
+			URL:       "/recordings/" + name,
+		})
+	}
+
+	// Sort by time descending (newest first)
+	sort.Slice(recordings, func(i, j int) bool {
+		ti, _ := time.Parse(time.RFC3339, recordings[i].CreatedAt)
+		tj, _ := time.Parse(time.RFC3339, recordings[j].CreatedAt)
+		return ti.After(tj)
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"recordings": recordings})
+}
+
+// handleRecordingFile serves or deletes a specific recording file
+func handleRecordingFile(w http.ResponseWriter, r *http.Request) {
+	// Extract filename from path: /recordings/{filename}
+	filename := strings.TrimPrefix(r.URL.Path, "/recordings/")
+	if filename == "" {
+		http.Error(w, "Filename required", http.StatusBadRequest)
+		return
+	}
+
+	// Security: prevent directory traversal
+	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
+		http.Error(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
+
+	filepath := "recordings/" + filename
+
+	switch r.Method {
+	case "GET":
+		// Serve the file
+		http.ServeFile(w, r, filepath)
+	case "DELETE":
+		// Delete the file
+		if err := os.Remove(filepath); err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "Recording not found", http.StatusNotFound)
+			} else {
+				http.Error(w, "Failed to delete", http.StatusInternalServerError)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"message": "Recording deleted"})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
