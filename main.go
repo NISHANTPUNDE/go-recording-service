@@ -131,7 +131,7 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		room = &Room{
 			ID:          roomID,
 			Clients:     make(map[string]*Client),
-			RecordingCh: make(chan *rtp.Packet, 1000),
+			RecordingCh: make(chan *rtp.Packet, 50000), // ~16 mins buffer at 50 pps
 		}
 		rooms[roomID] = room
 		go recordRoom(room)
@@ -227,11 +227,8 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 					break
 				}
 
-				// Send to recording
-				select {
-				case room.RecordingCh <- rtpPacket:
-				default:
-				}
+				// Send to recording (blocking to prevent drops)
+				room.RecordingCh <- rtpPacket
 
 				// Forward to other clients based on roles
 				forwardAudioPacket(room, clientID, role, rtpPacket)
