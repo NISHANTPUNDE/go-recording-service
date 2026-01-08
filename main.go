@@ -31,6 +31,7 @@ type Room struct {
 	OggWriter   *oggwriter.OggWriter
 	OggFilename string
 	Recording   bool
+	PacketCount int64 // Count packets for debugging
 	mu          sync.RWMutex
 	writerMu    sync.Mutex // Separate mutex for OGG writer
 }
@@ -242,6 +243,7 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 				if role == "admin" && room.Recording && room.OggWriter != nil {
 					room.writerMu.Lock()
 					room.OggWriter.WriteRTP(rtpPacket)
+					room.PacketCount++
 					room.writerMu.Unlock()
 				}
 
@@ -385,18 +387,28 @@ func handleLeaveRoom(msg map[string]interface{}) {
 		room.Recording = false
 		if room.OggWriter != nil {
 			room.OggWriter.Close()
-			log.Printf("[GO-SFU] Recording stopped: %s", room.OggFilename)
+			log.Printf("[GO-SFU] Recording stopped: %s (packets: %d)", room.OggFilename, room.PacketCount)
 
-			// Convert to WAV in background
-			go func(oggFile string) {
-				wavFile := oggFile[:len(oggFile)-4] + ".wav"
-				cmd := exec.Command("ffmpeg", "-y", "-i", oggFile, wavFile)
+			// Convert to MP3 with high quality settings
+			go func(oggFile string, packets int64) {
+				if packets == 0 {
+					log.Printf("[GO-SFU] WARNING: No audio packets recorded for %s", oggFile)
+					return
+				}
+				mp3File := oggFile[:len(oggFile)-4] + ".mp3"
+				// High quality conversion: use libmp3lame, 128kbps, 48kHz
+				cmd := exec.Command("ffmpeg", "-y", "-i", oggFile,
+					"-acodec", "libmp3lame",
+					"-ab", "128k",
+					"-ar", "48000",
+					"-ac", "1",
+					mp3File)
 				if err := cmd.Run(); err != nil {
 					log.Println("FFmpeg error:", err)
 				} else {
-					log.Printf("[GO-SFU] Converted to: %s", wavFile)
+					log.Printf("[GO-SFU] Converted to: %s", mp3File)
 				}
-			}(room.OggFilename)
+			}(room.OggFilename, room.PacketCount)
 		}
 		roomsMu.Lock()
 		delete(rooms, roomID)
@@ -469,7 +481,8 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name := file.Name()
-		if !strings.HasSuffix(name, ".ogg") && !strings.HasSuffix(name, ".wav") {
+		// Include MP3, OGG, and WAV files
+		if !strings.HasSuffix(name, ".mp3") && !strings.HasSuffix(name, ".ogg") && !strings.HasSuffix(name, ".wav") {
 			continue
 		}
 		recordings = append(recordings, RecordingInfo{
