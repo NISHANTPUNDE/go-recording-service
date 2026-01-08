@@ -28,9 +28,11 @@ type Room struct {
 	ID          string
 	Clients     map[string]*Client
 	AdminID     string
-	RecordingCh chan *rtp.Packet
+	OggWriter   *oggwriter.OggWriter
+	OggFilename string
 	Recording   bool
 	mu          sync.RWMutex
+	writerMu    sync.Mutex // Separate mutex for OGG writer
 }
 
 // Client represents a connected peer
@@ -40,7 +42,7 @@ type Client struct {
 	Conn        *websocket.Conn
 	PC          *webrtc.PeerConnection
 	AudioTrack  *webrtc.TrackRemote
-	OutputTrack *webrtc.TrackLocalStaticRTP // Track to send audio TO this client
+	OutputTrack *webrtc.TrackLocalStaticRTP
 	mu          sync.Mutex
 }
 
@@ -128,13 +130,25 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	roomsMu.Lock()
 	room, exists := rooms[roomID]
 	if !exists {
+		// Create OGG file for recording
+		os.MkdirAll("recordings", 0755)
+		filename := fmt.Sprintf("recordings/%s_%d.ogg", roomID, time.Now().Unix())
+		oggFile, err := oggwriter.New(filename, 48000, 2)
+		if err != nil {
+			log.Println("OGG writer error:", err)
+			roomsMu.Unlock()
+			return
+		}
+
 		room = &Room{
 			ID:          roomID,
 			Clients:     make(map[string]*Client),
-			RecordingCh: make(chan *rtp.Packet, 50000), // ~16 mins buffer at 50 pps
+			OggWriter:   oggFile,
+			OggFilename: filename,
+			Recording:   true,
 		}
 		rooms[roomID] = room
-		go recordRoom(room)
+		log.Printf("[GO-SFU] Recording started: %s", filename)
 	}
 	roomsMu.Unlock()
 
@@ -166,7 +180,7 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		return
 	}
 
-	// Create output track for this client (to send audio TO them)
+	// Create output track for this client
 	outputTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
 		fmt.Sprintf("audio-%s", clientID),
@@ -177,14 +191,12 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		return
 	}
 
-	// Add the output track to peer connection
 	sender, err := pc.AddTrack(outputTrack)
 	if err != nil {
 		log.Println("AddTrack error:", err)
 		return
 	}
 
-	// Read RTCP (required for WebRTC)
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
@@ -209,12 +221,11 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	}
 	room.mu.Unlock()
 
-	// Handle incoming audio track from this client
+	// Handle incoming audio track
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("[GO-SFU] Audio track received from %s (role: %s)", clientID, role)
 		client.AudioTrack = track
 
-		// Forward audio to other clients
 		go func() {
 			for {
 				rtpPacket, _, err := track.ReadRTP()
@@ -227,16 +238,19 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 					break
 				}
 
-				// Send to recording (blocking to prevent drops)
-				room.RecordingCh <- rtpPacket
+				// Write directly to OGG file (admin only, with mutex)
+				if role == "admin" && room.Recording && room.OggWriter != nil {
+					room.writerMu.Lock()
+					room.OggWriter.WriteRTP(rtpPacket)
+					room.writerMu.Unlock()
+				}
 
-				// Forward to other clients based on roles
+				// Forward to other clients
 				forwardAudioPacket(room, clientID, role, rtpPacket)
 			}
 		}()
 	})
 
-	// Send ICE candidates
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
 			candidate := c.ToJSON()
@@ -253,7 +267,6 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		log.Printf("[GO-SFU] Client %s connection state: %s", clientID, state.String())
 	})
 
-	// Send joined response
 	response := map[string]interface{}{
 		"type":     "joined",
 		"roomId":   roomID,
@@ -367,9 +380,24 @@ func handleLeaveRoom(msg map[string]interface{}) {
 		delete(room.Clients, clientID)
 	}
 
-	// If room is empty, clean up
+	// If room is empty, finalize recording
 	if len(room.Clients) == 0 {
-		close(room.RecordingCh)
+		room.Recording = false
+		if room.OggWriter != nil {
+			room.OggWriter.Close()
+			log.Printf("[GO-SFU] Recording stopped: %s", room.OggFilename)
+
+			// Convert to WAV in background
+			go func(oggFile string) {
+				wavFile := oggFile[:len(oggFile)-4] + ".wav"
+				cmd := exec.Command("ffmpeg", "-y", "-i", oggFile, wavFile)
+				if err := cmd.Run(); err != nil {
+					log.Println("FFmpeg error:", err)
+				} else {
+					log.Printf("[GO-SFU] Converted to: %s", wavFile)
+				}
+			}(room.OggFilename)
+		}
 		roomsMu.Lock()
 		delete(rooms, roomID)
 		roomsMu.Unlock()
@@ -386,18 +414,13 @@ func forwardAudioPacket(room *Room, senderID string, senderRole string, packet *
 
 	for clientID, client := range room.Clients {
 		if clientID == senderID {
-			continue // Don't send to self
+			continue
 		}
 
-		// Role-based routing:
-		// - Admin audio goes to everyone
-		// - User audio goes only to admin
 		shouldForward := false
 		if senderRole == "admin" {
-			// Admin speaks to all
 			shouldForward = true
 		} else if senderRole == "user" {
-			// User speaks only to admin
 			if client.Role == "admin" {
 				shouldForward = true
 			}
@@ -405,46 +428,13 @@ func forwardAudioPacket(room *Room, senderID string, senderRole string, packet *
 
 		if shouldForward && client.OutputTrack != nil {
 			if err := client.OutputTrack.WriteRTP(packet); err != nil {
-				log.Printf("WriteRTP error to %s: %v", clientID, err)
+				// Ignore write errors
 			}
 		}
 	}
 }
 
-// recordRoom saves all audio to OGG file
-func recordRoom(room *Room) {
-	filename := fmt.Sprintf("recordings/%s_%d.ogg", room.ID, time.Now().Unix())
-	os.MkdirAll("recordings", 0755)
-
-	oggFile, err := oggwriter.New(filename, 48000, 2)
-	if err != nil {
-		log.Println("OGG writer error:", err)
-		return
-	}
-	defer oggFile.Close()
-
-	log.Printf("[GO-SFU] Recording started: %s", filename)
-	room.Recording = true
-
-	for packet := range room.RecordingCh {
-		if err := oggFile.WriteRTP(packet); err != nil {
-			log.Println("OGG write error:", err)
-		}
-	}
-
-	log.Printf("[GO-SFU] Recording stopped: %s", filename)
-
-	// Convert to WAV using FFmpeg
-	wavFilename := filename[:len(filename)-4] + ".wav"
-	cmd := exec.Command("ffmpeg", "-y", "-i", filename, wavFilename)
-	if err := cmd.Run(); err != nil {
-		log.Println("FFmpeg conversion error:", err)
-	} else {
-		log.Printf("[GO-SFU] Converted to: %s", wavFilename)
-	}
-}
-
-// Recording represents a recording file for JSON response
+// RecordingInfo for JSON response
 type RecordingInfo struct {
 	Filename  string `json:"filename"`
 	Size      int64  `json:"size"`
@@ -452,7 +442,6 @@ type RecordingInfo struct {
 	URL       string `json:"url"`
 }
 
-// handleListRecordings returns all recordings as JSON
 func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -479,7 +468,6 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		// Only include audio files
 		name := file.Name()
 		if !strings.HasSuffix(name, ".ogg") && !strings.HasSuffix(name, ".wav") {
 			continue
@@ -492,7 +480,6 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Sort by time descending (newest first)
 	sort.Slice(recordings, func(i, j int) bool {
 		ti, _ := time.Parse(time.RFC3339, recordings[i].CreatedAt)
 		tj, _ := time.Parse(time.RFC3339, recordings[j].CreatedAt)
@@ -503,16 +490,13 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"recordings": recordings})
 }
 
-// handleRecordingFile serves or deletes a specific recording file
 func handleRecordingFile(w http.ResponseWriter, r *http.Request) {
-	// Extract filename from path: /recordings/{filename}
 	filename := strings.TrimPrefix(r.URL.Path, "/recordings/")
 	if filename == "" {
 		http.Error(w, "Filename required", http.StatusBadRequest)
 		return
 	}
 
-	// Security: prevent directory traversal
 	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
 		http.Error(w, "Invalid filename", http.StatusBadRequest)
 		return
@@ -522,10 +506,8 @@ func handleRecordingFile(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		// Serve the file
 		http.ServeFile(w, r, filepath)
 	case "DELETE":
-		// Delete the file
 		if err := os.Remove(filepath); err != nil {
 			if os.IsNotExist(err) {
 				http.Error(w, "Recording not found", http.StatusNotFound)
