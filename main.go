@@ -14,7 +14,6 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/pion/webrtc/v3/pkg/media/oggwriter"
 )
 
@@ -27,17 +26,20 @@ type Room struct {
 	ID          string
 	Clients     map[string]*Client
 	AdminID     string
-	RecordingCh chan *media.Sample
+	RecordingCh chan *rtp.Packet
 	Recording   bool
-	mu          sync.Mutex
+	mu          sync.RWMutex
 }
 
 // Client represents a connected peer
 type Client struct {
-	ID         string
-	Role       string // "admin" or "user"
-	PC         *webrtc.PeerConnection
-	AudioTrack *webrtc.TrackRemote
+	ID          string
+	Role        string // "admin" or "user"
+	Conn        *websocket.Conn
+	PC          *webrtc.PeerConnection
+	AudioTrack  *webrtc.TrackRemote
+	OutputTrack *webrtc.TrackLocalStaticRTP // Track to send audio TO this client
+	mu          sync.Mutex
 }
 
 var rooms = make(map[string]*Room)
@@ -79,7 +81,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		msgType := message["type"].(string)
+		msgType, ok := message["type"].(string)
+		if !ok {
+			continue
+		}
 		log.Printf("[GO-SFU] Received: %s", msgType)
 
 		switch msgType {
@@ -89,6 +94,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			handleOffer(conn, message)
 		case "ice-candidate":
 			handleICECandidate(conn, message)
+		case "leave-room":
+			handleLeaveRoom(message)
 		}
 	}
 }
@@ -96,7 +103,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	roomID := msg["roomId"].(string)
 	clientID := msg["clientId"].(string)
-	role := msg["role"].(string) // "admin" or "user"
+	role := msg["role"].(string)
 
 	roomsMu.Lock()
 	room, exists := rooms[roomID]
@@ -104,30 +111,75 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		room = &Room{
 			ID:          roomID,
 			Clients:     make(map[string]*Client),
-			RecordingCh: make(chan *media.Sample, 1000),
+			RecordingCh: make(chan *rtp.Packet, 1000),
 		}
 		rooms[roomID] = room
-		// Start recording goroutine
 		go recordRoom(room)
 	}
 	roomsMu.Unlock()
 
-	// Create peer connection
+	// Create peer connection with media engine
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
+		},
+		PayloadType: 111,
+	}, webrtc.RTPCodecTypeAudio); err != nil {
+		log.Println("RegisterCodec error:", err)
+		return
+	}
+
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		},
 	}
-	pc, err := webrtc.NewPeerConnection(config)
+
+	pc, err := api.NewPeerConnection(config)
 	if err != nil {
 		log.Println("PC creation error:", err)
 		return
 	}
 
+	// Create output track for this client (to send audio TO them)
+	outputTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		fmt.Sprintf("audio-%s", clientID),
+		fmt.Sprintf("stream-%s", clientID),
+	)
+	if err != nil {
+		log.Println("Track creation error:", err)
+		return
+	}
+
+	// Add the output track to peer connection
+	sender, err := pc.AddTrack(outputTrack)
+	if err != nil {
+		log.Println("AddTrack error:", err)
+		return
+	}
+
+	// Read RTCP (required for WebRTC)
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, err := sender.Read(rtcpBuf); err != nil {
+				return
+			}
+		}
+	}()
+
 	client := &Client{
-		ID:   clientID,
-		Role: role,
-		PC:   pc,
+		ID:          clientID,
+		Role:        role,
+		Conn:        conn,
+		PC:          pc,
+		OutputTrack: outputTrack,
 	}
 
 	room.mu.Lock()
@@ -137,39 +189,37 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	}
 	room.mu.Unlock()
 
-	// Handle incoming tracks
+	// Handle incoming audio track from this client
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("[GO-SFU] Track received from %s: %s", clientID, track.Kind().String())
+		log.Printf("[GO-SFU] Audio track received from %s (role: %s)", clientID, role)
 		client.AudioTrack = track
 
-		// Read audio and send to recording channel
+		// Forward audio to other clients
 		go func() {
 			for {
-				rtp, _, err := track.ReadRTP()
+				rtpPacket, _, err := track.ReadRTP()
 				if err != nil {
 					if err == io.EOF {
-						break
+						log.Printf("[GO-SFU] Track ended for %s", clientID)
+					} else {
+						log.Println("RTP read error:", err)
 					}
-					log.Println("RTP read error:", err)
 					break
 				}
-				// Forward to recording
-				sample := &media.Sample{
-					Data:     rtp.Payload,
-					Duration: time.Millisecond * 20,
-				}
+
+				// Send to recording
 				select {
-				case room.RecordingCh <- sample:
+				case room.RecordingCh <- rtpPacket:
 				default:
 				}
 
-				// Selective forwarding based on roles
-				forwardAudio(room, clientID, role, rtp.Payload)
+				// Forward to other clients based on roles
+				forwardAudioPacket(room, clientID, role, rtpPacket)
 			}
 		}()
 	})
 
-	// Send ICE candidates back
+	// Send ICE candidates
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
 			candidate := c.ToJSON()
@@ -182,7 +232,11 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		}
 	})
 
-	// Send success response
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("[GO-SFU] Client %s connection state: %s", clientID, state.String())
+	})
+
+	// Send joined response
 	response := map[string]interface{}{
 		"type":     "joined",
 		"roomId":   roomID,
@@ -190,6 +244,8 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	}
 	data, _ := json.Marshal(response)
 	conn.WriteMessage(websocket.TextMessage, data)
+
+	log.Printf("[GO-SFU] Client %s joined room %s as %s", clientID, roomID, role)
 }
 
 func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
@@ -200,15 +256,13 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 	roomsMu.Lock()
 	room := rooms[roomID]
 	roomsMu.Unlock()
-
 	if room == nil {
 		return
 	}
 
-	room.mu.Lock()
+	room.mu.RLock()
 	client := room.Clients[clientID]
-	room.mu.Unlock()
-
+	room.mu.RUnlock()
 	if client == nil {
 		return
 	}
@@ -218,8 +272,7 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 		SDP:  sdpString,
 	}
 
-	err := client.PC.SetRemoteDescription(offer)
-	if err != nil {
+	if err := client.PC.SetRemoteDescription(offer); err != nil {
 		log.Println("SetRemoteDescription error:", err)
 		return
 	}
@@ -230,8 +283,7 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 		return
 	}
 
-	err = client.PC.SetLocalDescription(answer)
-	if err != nil {
+	if err := client.PC.SetLocalDescription(answer); err != nil {
 		log.Println("SetLocalDescription error:", err)
 		return
 	}
@@ -242,6 +294,8 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 	}
 	data, _ := json.Marshal(response)
 	conn.WriteMessage(websocket.TextMessage, data)
+
+	log.Printf("[GO-SFU] Answer sent to %s", clientID)
 }
 
 func handleICECandidate(conn *websocket.Conn, msg map[string]interface{}) {
@@ -252,15 +306,13 @@ func handleICECandidate(conn *websocket.Conn, msg map[string]interface{}) {
 	roomsMu.Lock()
 	room := rooms[roomID]
 	roomsMu.Unlock()
-
 	if room == nil {
 		return
 	}
 
-	room.mu.Lock()
+	room.mu.RLock()
 	client := room.Clients[clientID]
-	room.mu.Unlock()
-
+	room.mu.RUnlock()
 	if client == nil {
 		return
 	}
@@ -269,36 +321,80 @@ func handleICECandidate(conn *websocket.Conn, msg map[string]interface{}) {
 		Candidate: candidateData["candidate"].(string),
 	}
 
-	client.PC.AddICECandidate(candidate)
+	if err := client.PC.AddICECandidate(candidate); err != nil {
+		log.Println("AddICECandidate error:", err)
+	}
 }
 
-// forwardAudio implements role-based audio routing
-func forwardAudio(room *Room, senderID string, senderRole string, payload []byte) {
+func handleLeaveRoom(msg map[string]interface{}) {
+	roomID, ok := msg["roomId"].(string)
+	if !ok {
+		return
+	}
+	clientID, ok := msg["clientId"].(string)
+	if !ok {
+		return
+	}
+
+	roomsMu.Lock()
+	room := rooms[roomID]
+	roomsMu.Unlock()
+	if room == nil {
+		return
+	}
+
 	room.mu.Lock()
-	defer room.mu.Unlock()
+	client := room.Clients[clientID]
+	if client != nil {
+		client.PC.Close()
+		delete(room.Clients, clientID)
+	}
+
+	// If room is empty, clean up
+	if len(room.Clients) == 0 {
+		close(room.RecordingCh)
+		roomsMu.Lock()
+		delete(rooms, roomID)
+		roomsMu.Unlock()
+	}
+	room.mu.Unlock()
+
+	log.Printf("[GO-SFU] Client %s left room %s", clientID, roomID)
+}
+
+// forwardAudioPacket forwards audio based on role rules
+func forwardAudioPacket(room *Room, senderID string, senderRole string, packet *rtp.Packet) {
+	room.mu.RLock()
+	defer room.mu.RUnlock()
 
 	for clientID, client := range room.Clients {
 		if clientID == senderID {
-			continue
+			continue // Don't send to self
 		}
 
 		// Role-based routing:
 		// - Admin audio goes to everyone
 		// - User audio goes only to admin
+		shouldForward := false
 		if senderRole == "admin" {
 			// Admin speaks to all
-			// TODO: Send to this client
+			shouldForward = true
 		} else if senderRole == "user" {
 			// User speaks only to admin
-			if client.Role != "admin" {
-				continue
+			if client.Role == "admin" {
+				shouldForward = true
 			}
-			// TODO: Send to admin
+		}
+
+		if shouldForward && client.OutputTrack != nil {
+			if err := client.OutputTrack.WriteRTP(packet); err != nil {
+				log.Printf("WriteRTP error to %s: %v", clientID, err)
+			}
 		}
 	}
 }
 
-// recordRoom saves all audio to file using FFmpeg
+// recordRoom saves all audio to OGG file
 func recordRoom(room *Room) {
 	filename := fmt.Sprintf("recordings/%s_%d.ogg", room.ID, time.Now().Unix())
 	os.MkdirAll("recordings", 0755)
@@ -313,16 +409,20 @@ func recordRoom(room *Room) {
 	log.Printf("[GO-SFU] Recording started: %s", filename)
 	room.Recording = true
 
-	for sample := range room.RecordingCh {
-		oggFile.WriteRTP(&rtp.Packet{
-			Payload: sample.Data,
-		})
+	for packet := range room.RecordingCh {
+		if err := oggFile.WriteRTP(packet); err != nil {
+			log.Println("OGG write error:", err)
+		}
 	}
 
 	log.Printf("[GO-SFU] Recording stopped: %s", filename)
 
 	// Convert to WAV using FFmpeg
 	wavFilename := filename[:len(filename)-4] + ".wav"
-	cmd := exec.Command("ffmpeg", "-i", filename, "-y", wavFilename)
-	cmd.Run()
+	cmd := exec.Command("ffmpeg", "-y", "-i", filename, wavFilename)
+	if err := cmd.Run(); err != nil {
+		log.Println("FFmpeg conversion error:", err)
+	} else {
+		log.Printf("[GO-SFU] Converted to: %s", wavFilename)
+	}
 }
