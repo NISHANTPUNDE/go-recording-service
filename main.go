@@ -239,8 +239,8 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 					break
 				}
 
-				// Write directly to OGG file (admin only, with mutex)
-				if role == "admin" && room.Recording && room.OggWriter != nil {
+				// Write ALL audio to OGG file (both admin and user)
+				if room.Recording && room.OggWriter != nil {
 					room.writerMu.Lock()
 					room.OggWriter.WriteRTP(rtpPacket)
 					room.PacketCount++
