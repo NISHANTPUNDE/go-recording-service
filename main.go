@@ -128,15 +128,21 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	roomsMu.Lock()
 	room, exists := rooms[roomID]
 	if !exists {
-		os.MkdirAll("recordings", 0755)
+		// Room will be created, but baseDir set when admin joins
 		room = &Room{
 			ID:        roomID,
 			Clients:   make(map[string]*Client),
-			BaseDir:   fmt.Sprintf("recordings/%s_%d", roomID, time.Now().Unix()),
 			Recording: true,
 		}
 		rooms[roomID] = room
 		log.Printf("[GO-SFU] Room created: %s", roomID)
+	}
+
+	// Set admin ID and create folder when admin joins
+	if role == "admin" && room.AdminID == "" {
+		room.AdminID = clientID[:8] // Use first 8 chars as admin ID
+		room.BaseDir = fmt.Sprintf("recordings/%s/%s_%d", room.AdminID, roomID, time.Now().Unix())
+		os.MkdirAll(room.BaseDir, 0755)
 	}
 	roomsMu.Unlock()
 
@@ -381,9 +387,12 @@ func handleLeaveRoom(msg map[string]interface{}) {
 
 // mergeRecordings combines all OGG files in a directory into one MP3
 func mergeRecordings(baseDir string, roomID string) {
+	// Wait a moment for files to be fully written
+	time.Sleep(1 * time.Second)
+
 	files, err := os.ReadDir(baseDir)
 	if err != nil {
-		log.Println("ReadDir error:", err)
+		log.Printf("[GO-SFU] ReadDir error for %s: %v", baseDir, err)
 		return
 	}
 
@@ -399,40 +408,43 @@ func mergeRecordings(baseDir string, roomID string) {
 		return
 	}
 
-	outputFile := fmt.Sprintf("recordings/%s_merged.mp3", roomID)
+	log.Printf("[GO-SFU] Merging %d files from %s", len(oggFiles), baseDir)
+	// Extract admin folder from baseDir: recordings/{adminId}/{roomId}_xxx
+	parts := strings.Split(baseDir, "/")
+	adminFolder := "recordings"
+	if len(parts) >= 2 {
+		adminFolder = strings.Join(parts[:2], "/") // recordings/{adminId}
+	}
+	outputFile := fmt.Sprintf("%s/%s_merged.mp3", adminFolder, roomID)
 
+	var cmd *exec.Cmd
 	if len(oggFiles) == 1 {
 		// Single file, just convert
-		cmd := exec.Command("ffmpeg", "-y", "-i", oggFiles[0],
+		cmd = exec.Command("ffmpeg", "-y", "-i", oggFiles[0],
 			"-acodec", "libmp3lame", "-ab", "128k", "-ar", "48000", "-ac", "1",
 			outputFile)
-		if err := cmd.Run(); err != nil {
-			log.Println("FFmpeg convert error:", err)
-		} else {
-			log.Printf("[GO-SFU] Converted: %s", outputFile)
-		}
 	} else {
 		// Multiple files, merge with amix filter
 		args := []string{"-y"}
 		for _, f := range oggFiles {
 			args = append(args, "-i", f)
 		}
-		// Mix all inputs together
 		filterComplex := fmt.Sprintf("amix=inputs=%d:duration=longest:dropout_transition=0", len(oggFiles))
 		args = append(args, "-filter_complex", filterComplex,
 			"-acodec", "libmp3lame", "-ab", "128k", "-ar", "48000", "-ac", "1",
 			outputFile)
-
-		cmd := exec.Command("ffmpeg", args...)
-		if err := cmd.Run(); err != nil {
-			log.Println("FFmpeg merge error:", err)
-		} else {
-			log.Printf("[GO-SFU] Merged %d files to: %s", len(oggFiles), outputFile)
-		}
+		cmd = exec.Command("ffmpeg", args...)
 	}
 
-	// Cleanup individual OGG files
-	os.RemoveAll(baseDir)
+	// Capture stderr for debugging
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[GO-SFU] FFmpeg error: %v\nOutput: %s", err, string(output))
+	} else {
+		log.Printf("[GO-SFU] Merged %d files to: %s", len(oggFiles), outputFile)
+		// Cleanup only on success
+		os.RemoveAll(baseDir)
+	}
 }
 
 func forwardAudioPacket(room *Room, senderID string, senderRole string, packet *rtp.Packet) {
@@ -463,33 +475,55 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	files, err := os.ReadDir("recordings")
+	// Scan recordings directory and all admin subdirectories
+	var recordings []RecordingInfo
+
+	adminDirs, err := os.ReadDir("recordings")
 	if err != nil {
 		if os.IsNotExist(err) {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"recordings": []RecordingInfo{}})
+			json.NewEncoder(w).Encode(map[string]interface{}{"recordings": recordings})
 			return
 		}
 		http.Error(w, "Failed to read recordings", http.StatusInternalServerError)
 		return
 	}
 
-	var recordings []RecordingInfo
-	for _, file := range files {
-		if file.IsDir() {
+	for _, adminDir := range adminDirs {
+		if !adminDir.IsDir() {
+			// Old format file in root
+			if strings.HasSuffix(adminDir.Name(), ".mp3") {
+				info, _ := adminDir.Info()
+				recordings = append(recordings, RecordingInfo{
+					Filename:  adminDir.Name(),
+					Size:      info.Size(),
+					CreatedAt: info.ModTime().Format(time.RFC3339),
+					URL:       "/recordings/" + adminDir.Name(),
+				})
+			}
 			continue
 		}
-		info, _ := file.Info()
-		name := file.Name()
-		if !strings.HasSuffix(name, ".mp3") && !strings.HasSuffix(name, ".ogg") && !strings.HasSuffix(name, ".wav") {
+
+		// Scan admin subdirectory for MP3 files
+		adminPath := "recordings/" + adminDir.Name()
+		files, err := os.ReadDir(adminPath)
+		if err != nil {
 			continue
 		}
-		recordings = append(recordings, RecordingInfo{
-			Filename:  name,
-			Size:      info.Size(),
-			CreatedAt: info.ModTime().Format(time.RFC3339),
-			URL:       "/recordings/" + name,
-		})
+
+		for _, file := range files {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".mp3") {
+				continue
+			}
+			info, _ := file.Info()
+			// URL: /recordings/{adminId}/{filename}
+			recordings = append(recordings, RecordingInfo{
+				Filename:  file.Name(),
+				Size:      info.Size(),
+				CreatedAt: info.ModTime().Format(time.RFC3339),
+				URL:       "/recordings/" + adminDir.Name() + "/" + file.Name(),
+			})
+		}
 	}
 
 	sort.Slice(recordings, func(i, j int) bool {
@@ -503,13 +537,14 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleRecordingFile(w http.ResponseWriter, r *http.Request) {
-	filename := strings.TrimPrefix(r.URL.Path, "/recordings/")
-	if filename == "" || strings.Contains(filename, "..") || strings.Contains(filename, "/") {
-		http.Error(w, "Invalid filename", http.StatusBadRequest)
+	// Path can be: /recordings/{filename} or /recordings/{adminId}/{filename}
+	path := strings.TrimPrefix(r.URL.Path, "/recordings/")
+	if path == "" || strings.Contains(path, "..") {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
 
-	filepath := "recordings/" + filename
+	filepath := "recordings/" + path
 	switch r.Method {
 	case "GET":
 		http.ServeFile(w, r, filepath)
