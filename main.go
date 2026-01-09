@@ -38,6 +38,7 @@ type Client struct {
 	ID          string
 	Role        string // "admin" or "user"
 	Conn        *websocket.Conn
+	connMu      sync.Mutex // Mutex for WebSocket writes
 	PC          *webrtc.PeerConnection
 	AudioTrack  *webrtc.TrackRemote
 	OutputTrack *webrtc.TrackLocalStaticRTP
@@ -265,7 +266,9 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 				"candidate": candidate,
 			}
 			data, _ := json.Marshal(response)
+			client.connMu.Lock()
 			conn.WriteMessage(websocket.TextMessage, data)
+			client.connMu.Unlock()
 		}
 	})
 
@@ -279,7 +282,9 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		"clientId": clientID,
 	}
 	data, _ := json.Marshal(response)
+	client.connMu.Lock()
 	conn.WriteMessage(websocket.TextMessage, data)
+	client.connMu.Unlock()
 
 	log.Printf("[GO-SFU] Client %s joined room %s as %s", clientID, roomID, role)
 }
@@ -314,7 +319,9 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 
 	response := map[string]interface{}{"type": "answer", "sdp": answer.SDP}
 	data, _ := json.Marshal(response)
+	client.connMu.Lock()
 	conn.WriteMessage(websocket.TextMessage, data)
+	client.connMu.Unlock()
 	log.Printf("[GO-SFU] Answer sent to %s", clientID)
 }
 
