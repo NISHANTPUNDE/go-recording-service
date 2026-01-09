@@ -25,15 +25,12 @@ var upgrader = websocket.Upgrader{
 
 // Room holds all peer connections for a room
 type Room struct {
-	ID          string
-	Clients     map[string]*Client
-	AdminID     string
-	OggWriter   *oggwriter.OggWriter
-	OggFilename string
-	Recording   bool
-	PacketCount int64 // Count packets for debugging
-	mu          sync.RWMutex
-	writerMu    sync.Mutex // Separate mutex for OGG writer
+	ID        string
+	Clients   map[string]*Client
+	AdminID   string
+	BaseDir   string // Directory for this room's recordings
+	Recording bool
+	mu        sync.RWMutex
 }
 
 // Client represents a connected peer
@@ -44,6 +41,9 @@ type Client struct {
 	PC          *webrtc.PeerConnection
 	AudioTrack  *webrtc.TrackRemote
 	OutputTrack *webrtc.TrackLocalStaticRTP
+	OggWriter   *oggwriter.OggWriter
+	OggFilename string
+	PacketCount int64
 	mu          sync.Mutex
 }
 
@@ -56,7 +56,6 @@ func main() {
 		port = "8081"
 	}
 
-	// CORS middleware
 	corsHandler := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -74,8 +73,6 @@ func main() {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 	})
-
-	// Recordings API
 	http.HandleFunc("/recordings", corsHandler(handleListRecordings))
 	http.HandleFunc("/recordings/", corsHandler(handleRecordingFile))
 
@@ -131,31 +128,31 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	roomsMu.Lock()
 	room, exists := rooms[roomID]
 	if !exists {
-		// Create OGG file for recording
 		os.MkdirAll("recordings", 0755)
-		filename := fmt.Sprintf("recordings/%s_%d.ogg", roomID, time.Now().Unix())
-		oggFile, err := oggwriter.New(filename, 48000, 2)
-		if err != nil {
-			log.Println("OGG writer error:", err)
-			roomsMu.Unlock()
-			return
-		}
-
 		room = &Room{
-			ID:          roomID,
-			Clients:     make(map[string]*Client),
-			OggWriter:   oggFile,
-			OggFilename: filename,
-			Recording:   true,
+			ID:        roomID,
+			Clients:   make(map[string]*Client),
+			BaseDir:   fmt.Sprintf("recordings/%s_%d", roomID, time.Now().Unix()),
+			Recording: true,
 		}
 		rooms[roomID] = room
-		log.Printf("[GO-SFU] Recording started: %s", filename)
+		log.Printf("[GO-SFU] Room created: %s", roomID)
 	}
 	roomsMu.Unlock()
 
-	// Create peer connection with media engine
+	// Create per-client OGG file
+	os.MkdirAll(room.BaseDir, 0755)
+	oggFilename := fmt.Sprintf("%s/%s_%s.ogg", room.BaseDir, role, clientID[:8])
+	oggFile, err := oggwriter.New(oggFilename, 48000, 2)
+	if err != nil {
+		log.Println("OGG writer error:", err)
+		return
+	}
+	log.Printf("[GO-SFU] Recording started for %s: %s", role, oggFilename)
+
+	// Create peer connection
 	m := &webrtc.MediaEngine{}
-	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+	m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeOpus,
 			ClockRate:   48000,
@@ -163,10 +160,7 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 			SDPFmtpLine: "minptime=10;useinbandfec=1",
 		},
 		PayloadType: 111,
-	}, webrtc.RTPCodecTypeAudio); err != nil {
-		log.Println("RegisterCodec error:", err)
-		return
-	}
+	}, webrtc.RTPCodecTypeAudio)
 
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 	config := webrtc.Configuration{
@@ -178,10 +172,10 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	pc, err := api.NewPeerConnection(config)
 	if err != nil {
 		log.Println("PC creation error:", err)
+		oggFile.Close()
 		return
 	}
 
-	// Create output track for this client
 	outputTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
 		fmt.Sprintf("audio-%s", clientID),
@@ -189,12 +183,14 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	)
 	if err != nil {
 		log.Println("Track creation error:", err)
+		oggFile.Close()
 		return
 	}
 
 	sender, err := pc.AddTrack(outputTrack)
 	if err != nil {
 		log.Println("AddTrack error:", err)
+		oggFile.Close()
 		return
 	}
 
@@ -213,6 +209,8 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		Conn:        conn,
 		PC:          pc,
 		OutputTrack: outputTrack,
+		OggWriter:   oggFile,
+		OggFilename: oggFilename,
 	}
 
 	room.mu.Lock()
@@ -222,9 +220,9 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	}
 	room.mu.Unlock()
 
-	// Handle incoming audio track
+	// Handle incoming audio
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("[GO-SFU] Audio track received from %s (role: %s)", clientID, role)
+		log.Printf("[GO-SFU] Audio track from %s (role: %s)", clientID, role)
 		client.AudioTrack = track
 
 		go func() {
@@ -239,13 +237,13 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 					break
 				}
 
-				// Write ALL audio to OGG file (both admin and user)
-				if room.Recording && room.OggWriter != nil {
-					room.writerMu.Lock()
-					room.OggWriter.WriteRTP(rtpPacket)
-					room.PacketCount++
-					room.writerMu.Unlock()
+				// Write to this client's own OGG file
+				client.mu.Lock()
+				if client.OggWriter != nil {
+					client.OggWriter.WriteRTP(rtpPacket)
+					client.PacketCount++
 				}
+				client.mu.Unlock()
 
 				// Forward to other clients
 				forwardAudioPacket(room, clientID, role, rtpPacket)
@@ -266,7 +264,7 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("[GO-SFU] Client %s connection state: %s", clientID, state.String())
+		log.Printf("[GO-SFU] Client %s state: %s", clientID, state.String())
 	})
 
 	response := map[string]interface{}{
@@ -299,34 +297,18 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 		return
 	}
 
-	offer := webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  sdpString,
-	}
-
+	offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdpString}
 	if err := client.PC.SetRemoteDescription(offer); err != nil {
 		log.Println("SetRemoteDescription error:", err)
 		return
 	}
 
-	answer, err := client.PC.CreateAnswer(nil)
-	if err != nil {
-		log.Println("CreateAnswer error:", err)
-		return
-	}
+	answer, _ := client.PC.CreateAnswer(nil)
+	client.PC.SetLocalDescription(answer)
 
-	if err := client.PC.SetLocalDescription(answer); err != nil {
-		log.Println("SetLocalDescription error:", err)
-		return
-	}
-
-	response := map[string]interface{}{
-		"type": "answer",
-		"sdp":  answer.SDP,
-	}
+	response := map[string]interface{}{"type": "answer", "sdp": answer.SDP}
 	data, _ := json.Marshal(response)
 	conn.WriteMessage(websocket.TextMessage, data)
-
 	log.Printf("[GO-SFU] Answer sent to %s", clientID)
 }
 
@@ -349,13 +331,8 @@ func handleICECandidate(conn *websocket.Conn, msg map[string]interface{}) {
 		return
 	}
 
-	candidate := webrtc.ICECandidateInit{
-		Candidate: candidateData["candidate"].(string),
-	}
-
-	if err := client.PC.AddICECandidate(candidate); err != nil {
-		log.Println("AddICECandidate error:", err)
-	}
+	candidate := webrtc.ICECandidateInit{Candidate: candidateData["candidate"].(string)}
+	client.PC.AddICECandidate(candidate)
 }
 
 func handleLeaveRoom(msg map[string]interface{}) {
@@ -378,38 +355,21 @@ func handleLeaveRoom(msg map[string]interface{}) {
 	room.mu.Lock()
 	client := room.Clients[clientID]
 	if client != nil {
+		// Close OGG file for this client
+		client.mu.Lock()
+		if client.OggWriter != nil {
+			client.OggWriter.Close()
+			log.Printf("[GO-SFU] Recording stopped for %s (packets: %d)", client.Role, client.PacketCount)
+		}
+		client.mu.Unlock()
 		client.PC.Close()
 		delete(room.Clients, clientID)
 	}
 
-	// If room is empty, finalize recording
+	// If room empty, merge all recordings
 	if len(room.Clients) == 0 {
 		room.Recording = false
-		if room.OggWriter != nil {
-			room.OggWriter.Close()
-			log.Printf("[GO-SFU] Recording stopped: %s (packets: %d)", room.OggFilename, room.PacketCount)
-
-			// Convert to MP3 with high quality settings
-			go func(oggFile string, packets int64) {
-				if packets == 0 {
-					log.Printf("[GO-SFU] WARNING: No audio packets recorded for %s", oggFile)
-					return
-				}
-				mp3File := oggFile[:len(oggFile)-4] + ".mp3"
-				// High quality conversion: use libmp3lame, 128kbps, 48kHz
-				cmd := exec.Command("ffmpeg", "-y", "-i", oggFile,
-					"-acodec", "libmp3lame",
-					"-ab", "128k",
-					"-ar", "48000",
-					"-ac", "1",
-					mp3File)
-				if err := cmd.Run(); err != nil {
-					log.Println("FFmpeg error:", err)
-				} else {
-					log.Printf("[GO-SFU] Converted to: %s", mp3File)
-				}
-			}(room.OggFilename, room.PacketCount)
-		}
+		go mergeRecordings(room.BaseDir, room.ID)
 		roomsMu.Lock()
 		delete(rooms, roomID)
 		roomsMu.Unlock()
@@ -419,7 +379,62 @@ func handleLeaveRoom(msg map[string]interface{}) {
 	log.Printf("[GO-SFU] Client %s left room %s", clientID, roomID)
 }
 
-// forwardAudioPacket forwards audio based on role rules
+// mergeRecordings combines all OGG files in a directory into one MP3
+func mergeRecordings(baseDir string, roomID string) {
+	files, err := os.ReadDir(baseDir)
+	if err != nil {
+		log.Println("ReadDir error:", err)
+		return
+	}
+
+	var oggFiles []string
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".ogg") {
+			oggFiles = append(oggFiles, baseDir+"/"+f.Name())
+		}
+	}
+
+	if len(oggFiles) == 0 {
+		log.Println("[GO-SFU] No OGG files to merge")
+		return
+	}
+
+	outputFile := fmt.Sprintf("recordings/%s_merged.mp3", roomID)
+
+	if len(oggFiles) == 1 {
+		// Single file, just convert
+		cmd := exec.Command("ffmpeg", "-y", "-i", oggFiles[0],
+			"-acodec", "libmp3lame", "-ab", "128k", "-ar", "48000", "-ac", "1",
+			outputFile)
+		if err := cmd.Run(); err != nil {
+			log.Println("FFmpeg convert error:", err)
+		} else {
+			log.Printf("[GO-SFU] Converted: %s", outputFile)
+		}
+	} else {
+		// Multiple files, merge with amix filter
+		args := []string{"-y"}
+		for _, f := range oggFiles {
+			args = append(args, "-i", f)
+		}
+		// Mix all inputs together
+		filterComplex := fmt.Sprintf("amix=inputs=%d:duration=longest:dropout_transition=0", len(oggFiles))
+		args = append(args, "-filter_complex", filterComplex,
+			"-acodec", "libmp3lame", "-ab", "128k", "-ar", "48000", "-ac", "1",
+			outputFile)
+
+		cmd := exec.Command("ffmpeg", args...)
+		if err := cmd.Run(); err != nil {
+			log.Println("FFmpeg merge error:", err)
+		} else {
+			log.Printf("[GO-SFU] Merged %d files to: %s", len(oggFiles), outputFile)
+		}
+	}
+
+	// Cleanup individual OGG files
+	os.RemoveAll(baseDir)
+}
+
 func forwardAudioPacket(room *Room, senderID string, senderRole string, packet *rtp.Packet) {
 	room.mu.RLock()
 	defer room.mu.RUnlock()
@@ -428,25 +443,13 @@ func forwardAudioPacket(room *Room, senderID string, senderRole string, packet *
 		if clientID == senderID {
 			continue
 		}
-
-		shouldForward := false
-		if senderRole == "admin" {
-			shouldForward = true
-		} else if senderRole == "user" {
-			if client.Role == "admin" {
-				shouldForward = true
-			}
-		}
-
+		shouldForward := senderRole == "admin" || client.Role == "admin"
 		if shouldForward && client.OutputTrack != nil {
-			if err := client.OutputTrack.WriteRTP(packet); err != nil {
-				// Ignore write errors
-			}
+			client.OutputTrack.WriteRTP(packet)
 		}
 	}
 }
 
-// RecordingInfo for JSON response
 type RecordingInfo struct {
 	Filename  string `json:"filename"`
 	Size      int64  `json:"size"`
@@ -476,12 +479,8 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 		if file.IsDir() {
 			continue
 		}
-		info, err := file.Info()
-		if err != nil {
-			continue
-		}
+		info, _ := file.Info()
 		name := file.Name()
-		// Include MP3, OGG, and WAV files
 		if !strings.HasSuffix(name, ".mp3") && !strings.HasSuffix(name, ".ogg") && !strings.HasSuffix(name, ".wav") {
 			continue
 		}
@@ -505,32 +504,21 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 
 func handleRecordingFile(w http.ResponseWriter, r *http.Request) {
 	filename := strings.TrimPrefix(r.URL.Path, "/recordings/")
-	if filename == "" {
-		http.Error(w, "Filename required", http.StatusBadRequest)
-		return
-	}
-
-	if strings.Contains(filename, "..") || strings.Contains(filename, "/") {
+	if filename == "" || strings.Contains(filename, "..") || strings.Contains(filename, "/") {
 		http.Error(w, "Invalid filename", http.StatusBadRequest)
 		return
 	}
 
 	filepath := "recordings/" + filename
-
 	switch r.Method {
 	case "GET":
 		http.ServeFile(w, r, filepath)
 	case "DELETE":
 		if err := os.Remove(filepath); err != nil {
-			if os.IsNotExist(err) {
-				http.Error(w, "Recording not found", http.StatusNotFound)
-			} else {
-				http.Error(w, "Failed to delete", http.StatusInternalServerError)
-			}
+			http.Error(w, "Failed to delete", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"message": "Recording deleted"})
+		json.NewEncoder(w).Encode(map[string]string{"message": "Deleted"})
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
