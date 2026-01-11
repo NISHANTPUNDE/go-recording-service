@@ -308,7 +308,11 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Packet) {
 	room.mu.RLock()
 	clients := room.Clients
+	activeSpeaker := room.ActiveSpeaker
+	lastSpoke := room.LastSpoke
 	room.mu.RUnlock()
+
+	now := time.Now()
 
 	for clientID, client := range clients {
 		if clientID == senderID {
@@ -320,8 +324,17 @@ func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Pa
 			// Admin broadcasts to all users
 			shouldForward = true
 		} else if senderRole == "user" && client.Role == "admin" {
-			// All users forward to admin (may have artifacts when simultaneous)
-			shouldForward = true
+			// Fast active speaker selection (20ms = 1 Opus frame)
+			// Forward if: no speaker, same speaker, or gap > 20ms
+			if activeSpeaker == "" || activeSpeaker == senderID ||
+				now.Sub(lastSpoke) > 20*time.Millisecond {
+				shouldForward = true
+				// Update active speaker
+				room.mu.Lock()
+				room.ActiveSpeaker = senderID
+				room.LastSpoke = now
+				room.mu.Unlock()
+			}
 		}
 
 		if shouldForward && client.OutputTrack != nil {
