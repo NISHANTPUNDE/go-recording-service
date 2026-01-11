@@ -49,6 +49,10 @@ type Client struct {
 	AdminOgg     *oggwriter.OggWriter
 	AdminOggFile string
 	JoinedAt     time.Time // To calculate delay
+	// RTP rewriting for multiple sources
+	outSeqNum    uint16
+	outTimestamp uint32
+	outMu        sync.Mutex
 }
 
 // FileMetadata stores delay info for merging
@@ -302,7 +306,27 @@ func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Pa
 		}
 
 		if shouldForward && client.OutputTrack != nil {
-			client.OutputTrack.WriteRTP(packet)
+			// Clone packet and rewrite sequence/timestamp for this output track
+			client.outMu.Lock()
+			client.outSeqNum++
+			client.outTimestamp += 960 // Opus uses 960 samples per frame at 48kHz (20ms)
+
+			newPacket := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        packet.Header.Version,
+					Padding:        packet.Header.Padding,
+					Extension:      packet.Header.Extension,
+					Marker:         packet.Header.Marker,
+					PayloadType:    packet.Header.PayloadType,
+					SequenceNumber: client.outSeqNum,
+					Timestamp:      client.outTimestamp,
+					SSRC:           packet.Header.SSRC,
+				},
+				Payload: packet.Payload,
+			}
+			client.outMu.Unlock()
+
+			client.OutputTrack.WriteRTP(newPacket)
 		}
 	}
 }
