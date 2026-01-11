@@ -31,6 +31,7 @@ type Room struct {
 	AdminFolder string // recordings/{adminId}/
 	Recording   bool
 	CreatedAt   time.Time // For synchronization
+	OutputSSRC  uint32    // Consistent SSRC for mixed output
 	mu          sync.RWMutex
 }
 
@@ -143,10 +144,11 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	room, exists := rooms[roomID]
 	if !exists {
 		room = &Room{
-			ID:        roomID,
-			Clients:   make(map[string]*Client),
-			Recording: true,
-			CreatedAt: now, // Start time of the meeting
+			ID:         roomID,
+			Clients:    make(map[string]*Client),
+			Recording:  true,
+			CreatedAt:  now,
+			OutputSSRC: uint32(time.Now().UnixNano() & 0xFFFFFFFF), // Random SSRC
 		}
 		rooms[roomID] = room
 		log.Printf("[GO-SFU] Room created: %s at %v", roomID, now)
@@ -306,21 +308,21 @@ func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Pa
 		}
 
 		if shouldForward && client.OutputTrack != nil {
-			// Clone packet and rewrite sequence/timestamp for this output track
+			// Clone packet with consistent sequence/timestamp/SSRC for clear audio
 			client.outMu.Lock()
 			client.outSeqNum++
-			client.outTimestamp += 960 // Opus uses 960 samples per frame at 48kHz (20ms)
+			client.outTimestamp += 960 // Opus 20ms frame
 
 			newPacket := &rtp.Packet{
 				Header: rtp.Header{
-					Version:        packet.Header.Version,
-					Padding:        packet.Header.Padding,
-					Extension:      packet.Header.Extension,
-					Marker:         packet.Header.Marker,
-					PayloadType:    packet.Header.PayloadType,
+					Version:        2,
+					Padding:        false,
+					Extension:      false,
+					Marker:         false,
+					PayloadType:    111, // Opus
 					SequenceNumber: client.outSeqNum,
 					Timestamp:      client.outTimestamp,
-					SSRC:           packet.Header.SSRC,
+					SSRC:           room.OutputSSRC, // Consistent SSRC for all mixed audio
 				},
 				Payload: packet.Payload,
 			}
@@ -405,14 +407,38 @@ func handleLeaveRoom(msg map[string]interface{}) {
 
 	room.mu.Lock()
 	client := room.Clients[clientID]
+	isAdmin := client != nil && client.Role == "admin"
+
 	if client != nil {
 		if client.OggWriter != nil {
 			client.OggWriter.Close()
 		}
 		client.PC.Close()
 		delete(room.Clients, clientID)
+		log.Printf("[GO-SFU] Client %s left room %s", clientID, roomID)
 	}
 
+	// If admin left, disconnect all users and end room
+	if isAdmin {
+		log.Printf("[GO-SFU] Admin left - ending room %s", roomID)
+		for cid, c := range room.Clients {
+			// Send room-ended message to each user
+			endMsg := map[string]interface{}{"type": "room-ended", "roomId": roomID}
+			data, _ := json.Marshal(endMsg)
+			c.connMu.Lock()
+			c.Conn.WriteMessage(websocket.TextMessage, data)
+			c.connMu.Unlock()
+			// Close their recording and connection
+			if c.OggWriter != nil {
+				c.OggWriter.Close()
+			}
+			c.PC.Close()
+			delete(room.Clients, cid)
+			log.Printf("[GO-SFU] Force-disconnected user %s", cid)
+		}
+	}
+
+	// If room empty, finalize recordings
 	if len(room.Clients) == 0 {
 		room.Recording = false
 		go finalizeRecordings(room.AdminFolder, roomID)
@@ -421,7 +447,6 @@ func handleLeaveRoom(msg map[string]interface{}) {
 		roomsMu.Unlock()
 	}
 	room.mu.Unlock()
-	log.Printf("[GO-SFU] Client %s left room %s", clientID, roomID)
 }
 
 func finalizeRecordings(adminFolder string, roomID string) {
