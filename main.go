@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -31,6 +30,7 @@ type Room struct {
 	AdminID     string
 	AdminFolder string // recordings/{adminId}/
 	Recording   bool
+	CreatedAt   time.Time // For synchronization
 	mu          sync.RWMutex
 }
 
@@ -46,12 +46,23 @@ type Client struct {
 	OggWriter    *oggwriter.OggWriter
 	OggFilename  string
 	PacketCount  int64
-	AdminOgg     *oggwriter.OggWriter // For users: write admin's audio here too
+	AdminOgg     *oggwriter.OggWriter
 	AdminOggFile string
+	JoinedAt     time.Time // To calculate delay
+}
+
+// FileMetadata stores delay info for merging
+type FileMetadata struct {
+	Filename string
+	DelayMs  int64
 }
 
 var rooms = make(map[string]*Room)
 var roomsMu sync.Mutex
+
+// Store metadata for recordings (roomId -> []FileMetadata)
+var recordingMeta = make(map[string][]FileMetadata)
+var metaMu sync.Mutex
 
 func main() {
 	port := os.Getenv("PORT")
@@ -79,7 +90,7 @@ func main() {
 	http.HandleFunc("/recordings", corsHandler(handleListRecordings))
 	http.HandleFunc("/recordings/", corsHandler(handleRecordingFile))
 
-	log.Printf("[GO-SFU] Starting on port %s (scalable for 200 users)", port)
+	log.Printf("[GO-SFU] Starting on port %s (Sync Fix)", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
@@ -104,7 +115,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		msgType, _ := message["type"].(string)
-		log.Printf("[GO-SFU] Received: %s", msgType)
 
 		switch msgType {
 		case "join-room":
@@ -123,6 +133,7 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	roomID := msg["roomId"].(string)
 	clientID := msg["clientId"].(string)
 	role := msg["role"].(string)
+	now := time.Now()
 
 	roomsMu.Lock()
 	room, exists := rooms[roomID]
@@ -131,12 +142,12 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 			ID:        roomID,
 			Clients:   make(map[string]*Client),
 			Recording: true,
+			CreatedAt: now, // Start time of the meeting
 		}
 		rooms[roomID] = room
-		log.Printf("[GO-SFU] Room created: %s", roomID)
+		log.Printf("[GO-SFU] Room created: %s at %v", roomID, now)
 	}
 
-	// Set admin folder when admin joins
 	if role == "admin" && room.AdminID == "" {
 		room.AdminID = clientID[:8]
 		room.AdminFolder = fmt.Sprintf("recordings/%s", room.AdminID)
@@ -144,21 +155,34 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	}
 	roomsMu.Unlock()
 
-	// Create per-client recording file
+	// Calculate delay relative to room creation
+	delayMs := now.Sub(room.CreatedAt).Milliseconds()
+	if delayMs < 0 {
+		delayMs = 0
+	}
+
 	var oggWriter *oggwriter.OggWriter
 	var oggFilename string
+
 	if room.AdminFolder != "" {
+		// e.g., recordings/ADMINID/ROOMID_user_CLIENTID.ogg
 		oggFilename = fmt.Sprintf("%s/%s_%s_%s.ogg", room.AdminFolder, roomID, role, clientID[:8])
 		var err error
 		oggWriter, err = oggwriter.New(oggFilename, 48000, 2)
 		if err != nil {
 			log.Printf("[GO-SFU] OGG writer error: %v", err)
 		} else {
-			log.Printf("[GO-SFU] Recording started: %s", oggFilename)
+			// Store metadata for sync
+			metaMu.Lock()
+			recordingMeta[roomID] = append(recordingMeta[roomID], FileMetadata{
+				Filename: oggFilename,
+				DelayMs:  delayMs,
+			})
+			metaMu.Unlock()
+			log.Printf("[GO-SFU] Recording started: %s (Delay: %d ms)", oggFilename, delayMs)
 		}
 	}
 
-	// Create WebRTC peer connection
 	m := &webrtc.MediaEngine{}
 	m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -183,7 +207,6 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		return
 	}
 
-	// Create output track for sending audio to this client
 	outputTrack, _ := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
 		fmt.Sprintf("audio-%s", clientID),
@@ -208,13 +231,13 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		OutputTrack: outputTrack,
 		OggWriter:   oggWriter,
 		OggFilename: oggFilename,
+		JoinedAt:    now,
 	}
 
 	room.mu.Lock()
 	room.Clients[clientID] = client
 	room.mu.Unlock()
 
-	// Handle incoming audio from this client
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		log.Printf("[GO-SFU] Audio track from %s (role: %s)", clientID, role)
 		client.AudioTrack = track
@@ -223,19 +246,13 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 			for {
 				rtpPacket, _, err := track.ReadRTP()
 				if err != nil {
-					if err == io.EOF {
-						log.Printf("[GO-SFU] Track ended for %s", clientID)
-					}
 					break
 				}
 
-				// Record this client's audio
 				if client.OggWriter != nil {
 					client.OggWriter.WriteRTP(rtpPacket)
 					atomic.AddInt64(&client.PacketCount, 1)
 				}
-
-				// Forward audio based on role
 				forwardAudio(room, clientID, role, rtpPacket)
 			}
 		}()
@@ -255,11 +272,6 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		}
 	})
 
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("[GO-SFU] Client %s state: %s", clientID, state.String())
-	})
-
-	// Send joined confirmation
 	response := map[string]interface{}{
 		"type":     "joined",
 		"roomId":   roomID,
@@ -273,9 +285,6 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	log.Printf("[GO-SFU] Client %s joined room %s as %s", clientID, roomID, role)
 }
 
-// forwardAudio routes audio based on role:
-// - Admin audio → ALL users
-// - User audio → Admin ONLY
 func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Packet) {
 	room.mu.RLock()
 	defer room.mu.RUnlock()
@@ -287,10 +296,8 @@ func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Pa
 
 		shouldForward := false
 		if senderRole == "admin" {
-			// Admin broadcasts to ALL users
 			shouldForward = true
 		} else if senderRole == "user" && client.Role == "admin" {
-			// Users only send to admin
 			shouldForward = true
 		}
 
@@ -333,7 +340,6 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 	client.connMu.Lock()
 	conn.WriteMessage(websocket.TextMessage, data)
 	client.connMu.Unlock()
-	log.Printf("[GO-SFU] Answer sent to %s", clientID)
 }
 
 func handleICECandidate(conn *websocket.Conn, msg map[string]interface{}) {
@@ -376,16 +382,13 @@ func handleLeaveRoom(msg map[string]interface{}) {
 	room.mu.Lock()
 	client := room.Clients[clientID]
 	if client != nil {
-		// Close recording for this client
 		if client.OggWriter != nil {
 			client.OggWriter.Close()
-			log.Printf("[GO-SFU] Recording stopped for %s (packets: %d)", client.Role, client.PacketCount)
 		}
 		client.PC.Close()
 		delete(room.Clients, clientID)
 	}
 
-	// If room is empty, finalize recordings
 	if len(room.Clients) == 0 {
 		room.Recording = false
 		go finalizeRecordings(room.AdminFolder, roomID)
@@ -394,64 +397,65 @@ func handleLeaveRoom(msg map[string]interface{}) {
 		roomsMu.Unlock()
 	}
 	room.mu.Unlock()
-
 	log.Printf("[GO-SFU] Client %s left room %s", clientID, roomID)
 }
 
-// finalizeRecordings creates merged recordings for admin
 func finalizeRecordings(adminFolder string, roomID string) {
 	if adminFolder == "" {
 		return
 	}
-	time.Sleep(1 * time.Second) // Wait for files to be written
+	time.Sleep(1 * time.Second)
 
-	files, err := os.ReadDir(adminFolder)
-	if err != nil {
-		log.Printf("[GO-SFU] ReadDir error: %v", err)
+	// Get metadata for this room
+	metaMu.Lock()
+	filesMeta, ok := recordingMeta[roomID]
+	delete(recordingMeta, roomID) // clean up
+	metaMu.Unlock()
+
+	if !ok || len(filesMeta) == 0 {
+		log.Println("[GO-SFU] No file metadata for merge")
 		return
 	}
 
-	// Find all OGG files for this room
-	var oggFiles []string
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), roomID) && strings.HasSuffix(f.Name(), ".ogg") {
-			oggFiles = append(oggFiles, adminFolder+"/"+f.Name())
-		}
-	}
-
-	if len(oggFiles) == 0 {
-		log.Println("[GO-SFU] No OGG files to merge")
-		return
-	}
-
-	log.Printf("[GO-SFU] Merging %d files for room %s", len(oggFiles), roomID)
+	log.Printf("[GO-SFU] Merging %d files for room %s with alignment", len(filesMeta), roomID)
 	outputFile := fmt.Sprintf("%s/%s_merged.mp3", adminFolder, roomID)
 
-	var cmd *exec.Cmd
-	if len(oggFiles) == 1 {
-		cmd = exec.Command("ffmpeg", "-y", "-i", oggFiles[0],
-			"-acodec", "libmp3lame", "-ab", "128k", "-ar", "48000", "-ac", "1",
-			outputFile)
-	} else {
-		args := []string{"-y"}
-		for _, f := range oggFiles {
-			args = append(args, "-i", f)
-		}
-		filterComplex := fmt.Sprintf("amix=inputs=%d:duration=longest:dropout_transition=0", len(oggFiles))
-		args = append(args, "-filter_complex", filterComplex,
-			"-acodec", "libmp3lame", "-ab", "128k", "-ar", "48000", "-ac", "1",
-			outputFile)
-		cmd = exec.Command("ffmpeg", args...)
+	// Build FFmpeg command with complex filter
+	// ffmpeg -i file1 -i file2 ... -filter_complex "[0:a]adelay=delay1|delay1[a0];[1:a]adelay=delay2|delay2[a1];[a0][a1]amix=inputs=2..." output
+
+	args := []string{"-y"}
+	for _, f := range filesMeta {
+		args = append(args, "-i", f.Filename)
 	}
 
+	var filters []string
+	var inputs []string
+
+	for i, f := range filesMeta {
+		delay := f.DelayMs
+		// adelay takes delay in milliseconds. For stereo, use "del|del" (or just del if it applies to all channels)
+		// We'll safe-guard with del|del assuming stereo or mono-compatible syntax
+		filterTag := fmt.Sprintf("[a%d]", i)
+		filters = append(filters, fmt.Sprintf("[%d:a]adelay=%d|%d%s", i, delay, delay, filterTag))
+		inputs = append(inputs, filterTag)
+	}
+
+	filterChain := strings.Join(filters, ";") + ";" + strings.Join(inputs, "") + fmt.Sprintf("amix=inputs=%d:duration=longest:dropout_transition=0", len(filesMeta))
+
+	args = append(args, "-filter_complex", filterChain,
+		"-acodec", "libmp3lame", "-ab", "128k", "-ar", "48000", "-ac", "1",
+		outputFile)
+
+	cmd := exec.Command("ffmpeg", args...)
 	output, err := cmd.CombinedOutput()
+
 	if err != nil {
 		log.Printf("[GO-SFU] FFmpeg error: %v\nOutput: %s", err, string(output))
 	} else {
 		log.Printf("[GO-SFU] Merged to: %s", outputFile)
 		// Cleanup OGG files
-		for _, f := range oggFiles {
-			os.Remove(f)
+		for _, f := range filesMeta {
+			os.Remove(f.Filename)
 		}
 	}
 }
@@ -470,15 +474,10 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var recordings []RecordingInfo
-
 	adminDirs, err := os.ReadDir("recordings")
 	if err != nil {
-		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{"recordings": recordings})
-			return
-		}
-		http.Error(w, "Failed to read recordings", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"recordings": recordings})
 		return
 	}
 
@@ -498,7 +497,6 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 
 		adminPath := "recordings/" + adminDir.Name()
 		files, _ := os.ReadDir(adminPath)
-
 		for _, file := range files {
 			if file.IsDir() || !strings.HasSuffix(file.Name(), ".mp3") {
 				continue
@@ -525,22 +523,17 @@ func handleListRecordings(w http.ResponseWriter, r *http.Request) {
 
 func handleRecordingFile(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/recordings/")
-	if path == "" || strings.Contains(path, "..") {
+	filepath := "recordings/" + path
+	if strings.Contains(path, "..") {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
 
-	filepath := "recordings/" + path
 	switch r.Method {
 	case "GET":
 		http.ServeFile(w, r, filepath)
 	case "DELETE":
-		if err := os.Remove(filepath); err != nil {
-			http.Error(w, "Failed to delete", http.StatusInternalServerError)
-			return
-		}
+		os.Remove(filepath)
 		json.NewEncoder(w).Encode(map[string]string{"message": "Deleted"})
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
