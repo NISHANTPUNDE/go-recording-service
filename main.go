@@ -37,23 +37,19 @@ type Room struct {
 
 // Client represents a connected user
 type Client struct {
-	ID           string
-	Role         string // "admin" or "user"
-	Conn         *websocket.Conn
-	connMu       sync.Mutex // Mutex for WebSocket writes
-	PC           *webrtc.PeerConnection
-	AudioTrack   *webrtc.TrackRemote
-	OutputTrack  *webrtc.TrackLocalStaticRTP
-	OggWriter    *oggwriter.OggWriter
-	OggFilename  string
-	PacketCount  int64
-	AdminOgg     *oggwriter.OggWriter
-	AdminOggFile string
-	JoinedAt     time.Time // To calculate delay
-	// RTP rewriting for multiple sources
-	outSeqNum    uint16
-	outTimestamp uint32
-	outMu        sync.Mutex
+	ID          string
+	Role        string // "admin" or "user"
+	Conn        *websocket.Conn
+	connMu      sync.Mutex // Mutex for WebSocket writes
+	PC          *webrtc.PeerConnection
+	AudioTrack  *webrtc.TrackRemote
+	OutputTrack *webrtc.TrackLocalStaticRTP            // For users: receives admin audio
+	UserTracks  map[string]*webrtc.TrackLocalStaticRTP // For admin: one track per user
+	OggWriter   *oggwriter.OggWriter
+	OggFilename string
+	PacketCount int64
+	JoinedAt    time.Time
+	mu          sync.Mutex
 }
 
 // FileMetadata stores delay info for merging
@@ -240,8 +236,37 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 		JoinedAt:    now,
 	}
 
+	// Admin needs a UserTracks map for receiving audio from multiple users
+	if role == "admin" {
+		client.UserTracks = make(map[string]*webrtc.TrackLocalStaticRTP)
+	}
+
 	room.mu.Lock()
 	room.Clients[clientID] = client
+
+	// If this is a user joining, add a track to admin's PC for this user's audio
+	if role == "user" {
+		for _, adminClient := range room.Clients {
+			if adminClient.Role == "admin" && adminClient.PC != nil {
+				// Create a dedicated track on admin's PC for this user
+				userTrack, err := webrtc.NewTrackLocalStaticRTP(
+					webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+					fmt.Sprintf("user-audio-%s", clientID[:8]),
+					fmt.Sprintf("user-stream-%s", clientID[:8]),
+				)
+				if err == nil {
+					adminClient.PC.AddTrack(userTrack)
+					adminClient.mu.Lock()
+					if adminClient.UserTracks == nil {
+						adminClient.UserTracks = make(map[string]*webrtc.TrackLocalStaticRTP)
+					}
+					adminClient.UserTracks[clientID] = userTrack
+					adminClient.mu.Unlock()
+					log.Printf("[GO-SFU] Added user track for %s on admin's PC", clientID[:8])
+				}
+			}
+		}
+	}
 	room.mu.Unlock()
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
@@ -295,40 +320,27 @@ func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Pa
 	room.mu.RLock()
 	defer room.mu.RUnlock()
 
-	for clientID, client := range room.Clients {
-		if clientID == senderID {
-			continue
-		}
-
-		shouldForward := false
-		if senderRole == "admin" {
-			shouldForward = true
-		} else if senderRole == "user" && client.Role == "admin" {
-			shouldForward = true
-		}
-
-		if shouldForward && client.OutputTrack != nil {
-			// Clone packet with consistent sequence/timestamp/SSRC for clear audio
-			client.outMu.Lock()
-			client.outSeqNum++
-			client.outTimestamp += 960 // Opus 20ms frame
-
-			newPacket := &rtp.Packet{
-				Header: rtp.Header{
-					Version:        2,
-					Padding:        false,
-					Extension:      false,
-					Marker:         false,
-					PayloadType:    111, // Opus
-					SequenceNumber: client.outSeqNum,
-					Timestamp:      client.outTimestamp,
-					SSRC:           room.OutputSSRC, // Consistent SSRC for all mixed audio
-				},
-				Payload: packet.Payload,
+	if senderRole == "admin" {
+		// Admin broadcasts to all users via their OutputTrack
+		for clientID, client := range room.Clients {
+			if clientID == senderID || client.Role != "user" {
+				continue
 			}
-			client.outMu.Unlock()
-
-			client.OutputTrack.WriteRTP(newPacket)
+			if client.OutputTrack != nil {
+				client.OutputTrack.WriteRTP(packet)
+			}
+		}
+	} else if senderRole == "user" {
+		// User sends to admin via admin's dedicated track for this user
+		for _, client := range room.Clients {
+			if client.Role != "admin" {
+				continue
+			}
+			if client.UserTracks != nil {
+				if track, ok := client.UserTracks[senderID]; ok && track != nil {
+					track.WriteRTP(packet)
+				}
+			}
 		}
 	}
 }
