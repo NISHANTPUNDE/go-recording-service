@@ -28,13 +28,17 @@ type Room struct {
 	ID            string
 	Clients       map[string]*Client
 	AdminID       string
-	AdminFolder   string // recordings/{adminId}/
+	AdminFolder   string
 	Recording     bool
-	CreatedAt     time.Time // For synchronization
-	OutputSSRC    uint32    // Consistent SSRC for mixed output
-	ActiveSpeaker string    // Current active speaker ID
-	LastSpoke     time.Time // When active speaker last sent audio
-	mu            sync.RWMutex
+	CreatedAt     time.Time
+	OutputSSRC    uint32
+	ActiveSpeaker string
+	LastSpoke     time.Time
+	// Multi-track support: map[userID] -> output track on admin's PC
+	UserTracks   map[string]*webrtc.TrackLocalStaticRTP
+	UserTrackSeq map[string]uint16 // Sequence number per user track
+	UserTrackTs  map[string]uint32 // Timestamp per user track
+	mu           sync.RWMutex
 }
 
 // Client represents a connected user
@@ -143,7 +147,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			handleICECandidate(conn, message)
 		case "leave-room":
 			handleLeaveRoom(message)
-			connRoomID, connClientID = "", "" // Clear tracking
+			connRoomID, connClientID = "", ""
+		case "renegotiate-answer":
+			handleRenegotiateAnswer(message)
 		}
 	}
 }
@@ -158,11 +164,14 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	room, exists := rooms[roomID]
 	if !exists {
 		room = &Room{
-			ID:         roomID,
-			Clients:    make(map[string]*Client),
-			Recording:  true,
-			CreatedAt:  now,
-			OutputSSRC: uint32(time.Now().UnixNano() & 0xFFFFFFFF), // Random SSRC
+			ID:           roomID,
+			Clients:      make(map[string]*Client),
+			Recording:    true,
+			CreatedAt:    now,
+			OutputSSRC:   uint32(time.Now().UnixNano() & 0xFFFFFFFF),
+			UserTracks:   make(map[string]*webrtc.TrackLocalStaticRTP),
+			UserTrackSeq: make(map[string]uint16),
+			UserTrackTs:  make(map[string]uint32),
 		}
 		rooms[roomID] = room
 		log.Printf("[GO-SFU] Room created: %s at %v", roomID, now)
@@ -303,61 +312,119 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 	client.connMu.Unlock()
 
 	log.Printf("[GO-SFU] Client %s joined room %s as %s", clientID, roomID, role)
+
+	// If this is a user joining and admin exists, create a dedicated track for this user
+	if role == "user" {
+		room.mu.RLock()
+		var admin *Client
+		for _, c := range room.Clients {
+			if c.Role == "admin" {
+				admin = c
+				break
+			}
+		}
+		room.mu.RUnlock()
+
+		if admin != nil && admin.PC != nil {
+			// Create a dedicated track for this user on admin's connection
+			userTrack, err := webrtc.NewTrackLocalStaticRTP(
+				webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+				fmt.Sprintf("audio-user-%s", clientID[:8]),
+				fmt.Sprintf("stream-user-%s", clientID[:8]),
+			)
+			if err == nil {
+				sender, addErr := admin.PC.AddTrack(userTrack)
+				if addErr == nil {
+					// Store the track
+					room.mu.Lock()
+					room.UserTracks[clientID] = userTrack
+					room.UserTrackSeq[clientID] = 0
+					room.UserTrackTs[clientID] = 0
+					room.mu.Unlock()
+
+					// Read RTCP in background
+					go func() {
+						rtcpBuf := make([]byte, 1500)
+						for {
+							if _, _, err := sender.Read(rtcpBuf); err != nil {
+								return
+							}
+						}
+					}()
+
+					// Trigger renegotiation - create new offer from admin
+					offer, err := admin.PC.CreateOffer(nil)
+					if err == nil {
+						admin.PC.SetLocalDescription(offer)
+						renegMsg := map[string]interface{}{
+							"type": "renegotiate",
+							"sdp":  offer.SDP,
+						}
+						renegData, _ := json.Marshal(renegMsg)
+						admin.connMu.Lock()
+						admin.Conn.WriteMessage(websocket.TextMessage, renegData)
+						admin.connMu.Unlock()
+						log.Printf("[GO-SFU] Created track for user %s on admin, renegotiating", clientID[:8])
+					}
+				}
+			}
+		}
+	}
 }
 
 func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Packet) {
 	room.mu.RLock()
 	clients := room.Clients
-	activeSpeaker := room.ActiveSpeaker
-	lastSpoke := room.LastSpoke
+	userTracks := room.UserTracks
 	room.mu.RUnlock()
 
-	now := time.Now()
+	if senderRole == "admin" {
+		// Admin broadcasts to all users using their single output track
+		for clientID, client := range clients {
+			if clientID == senderID || client.Role != "user" {
+				continue
+			}
+			if client.OutputTrack != nil {
+				client.outMu.Lock()
+				client.outSeqNum++
+				client.outTimestamp += 960
 
-	for clientID, client := range clients {
-		if clientID == senderID {
-			continue
-		}
-
-		shouldForward := false
-		if senderRole == "admin" {
-			// Admin broadcasts to all users
-			shouldForward = true
-		} else if senderRole == "user" && client.Role == "admin" {
-			// Fast active speaker selection (20ms = 1 Opus frame)
-			// Forward if: no speaker, same speaker, or gap > 20ms
-			if activeSpeaker == "" || activeSpeaker == senderID ||
-				now.Sub(lastSpoke) > 20*time.Millisecond {
-				shouldForward = true
-				// Update active speaker
-				room.mu.Lock()
-				room.ActiveSpeaker = senderID
-				room.LastSpoke = now
-				room.mu.Unlock()
+				newPacket := &rtp.Packet{
+					Header: rtp.Header{
+						Version:        2,
+						PayloadType:    111,
+						SequenceNumber: client.outSeqNum,
+						Timestamp:      client.outTimestamp,
+						SSRC:           room.OutputSSRC,
+					},
+					Payload: packet.Payload,
+				}
+				client.outMu.Unlock()
+				client.OutputTrack.WriteRTP(newPacket)
 			}
 		}
-
-		if shouldForward && client.OutputTrack != nil {
-			client.outMu.Lock()
-			client.outSeqNum++
-			client.outTimestamp += 960
+	} else if senderRole == "user" {
+		// User audio goes to their dedicated track on admin's connection
+		room.mu.Lock()
+		track, exists := userTracks[senderID]
+		if exists && track != nil {
+			room.UserTrackSeq[senderID]++
+			room.UserTrackTs[senderID] += 960
 
 			newPacket := &rtp.Packet{
 				Header: rtp.Header{
 					Version:        2,
-					Padding:        false,
-					Extension:      false,
-					Marker:         false,
 					PayloadType:    111,
-					SequenceNumber: client.outSeqNum,
-					Timestamp:      client.outTimestamp,
-					SSRC:           room.OutputSSRC,
+					SequenceNumber: room.UserTrackSeq[senderID],
+					Timestamp:      room.UserTrackTs[senderID],
+					SSRC:           uint32(time.Now().UnixNano()) & 0xFFFFFFFF,
 				},
 				Payload: packet.Payload,
 			}
-			client.outMu.Unlock()
-
-			client.OutputTrack.WriteRTP(newPacket)
+			room.mu.Unlock()
+			track.WriteRTP(newPacket)
+		} else {
+			room.mu.Unlock()
 		}
 	}
 }
@@ -395,6 +462,33 @@ func handleOffer(conn *websocket.Conn, msg map[string]interface{}) {
 	client.connMu.Lock()
 	conn.WriteMessage(websocket.TextMessage, data)
 	client.connMu.Unlock()
+}
+
+func handleRenegotiateAnswer(msg map[string]interface{}) {
+	roomID := msg["roomId"].(string)
+	clientID := msg["clientId"].(string)
+	sdpString := msg["sdp"].(string)
+
+	roomsMu.Lock()
+	room := rooms[roomID]
+	roomsMu.Unlock()
+	if room == nil {
+		return
+	}
+
+	room.mu.RLock()
+	client := room.Clients[clientID]
+	room.mu.RUnlock()
+	if client == nil {
+		return
+	}
+
+	answer := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdpString}
+	if err := client.PC.SetRemoteDescription(answer); err != nil {
+		log.Println("Renegotiate SetRemoteDescription error:", err)
+	} else {
+		log.Printf("[GO-SFU] Renegotiation complete for %s", clientID[:8])
+	}
 }
 
 func handleICECandidate(conn *websocket.Conn, msg map[string]interface{}) {
