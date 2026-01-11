@@ -109,10 +109,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	var connRoomID, connClientID string // Track this connection's room/client
+
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			log.Println("Read error:", err)
+			// Clean up on disconnect
+			if connRoomID != "" && connClientID != "" {
+				handleLeaveRoom(map[string]interface{}{
+					"roomId":   connRoomID,
+					"clientId": connClientID,
+				})
+			}
 			break
 		}
 
@@ -126,12 +135,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		switch msgType {
 		case "join-room":
 			handleJoinRoom(conn, message)
+			connRoomID, _ = message["roomId"].(string)
+			connClientID, _ = message["clientId"].(string)
 		case "offer":
 			handleOffer(conn, message)
 		case "ice-candidate":
 			handleICECandidate(conn, message)
 		case "leave-room":
 			handleLeaveRoom(message)
+			connRoomID, connClientID = "", "" // Clear tracking
 		}
 	}
 }
@@ -296,11 +308,7 @@ func handleJoinRoom(conn *websocket.Conn, msg map[string]interface{}) {
 func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Packet) {
 	room.mu.RLock()
 	clients := room.Clients
-	activeSpeaker := room.ActiveSpeaker
-	lastSpoke := room.LastSpoke
 	room.mu.RUnlock()
-
-	now := time.Now()
 
 	for clientID, client := range clients {
 		if clientID == senderID {
@@ -312,20 +320,8 @@ func forwardAudio(room *Room, senderID string, senderRole string, packet *rtp.Pa
 			// Admin broadcasts to all users
 			shouldForward = true
 		} else if senderRole == "user" && client.Role == "admin" {
-			// Users to admin: use active speaker selection
-			// Allow this sender if:
-			// 1. No active speaker yet
-			// 2. This IS the active speaker
-			// 3. Active speaker hasn't spoken for 150ms (switch to new speaker)
-			if activeSpeaker == "" || activeSpeaker == senderID ||
-				now.Sub(lastSpoke) > 150*time.Millisecond {
-				shouldForward = true
-				// Update active speaker
-				room.mu.Lock()
-				room.ActiveSpeaker = senderID
-				room.LastSpoke = now
-				room.mu.Unlock()
-			}
+			// All users forward to admin (may have artifacts when simultaneous)
+			shouldForward = true
 		}
 
 		if shouldForward && client.OutputTrack != nil {
